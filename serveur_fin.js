@@ -31,9 +31,10 @@ function sendJsonMessage(socket, type, data = {}) {
   if (socket.readyState === WebSocket.OPEN) {
     const message = JSON.stringify({ type, ...data });
     socket.send(message);
-    console.log(`Message envoyé à ${getClientType(socket)}: ${message}`);
+    console.log(`Message envoyé à ${getClientType(socket)} (ID: ${socket.clientId}): ${message}`);
     return true;
   }
+  console.log(`Échec envoi message à ${getClientType(socket)} (ID: ${socket.clientId}): socket fermé`);
   return false;
 }
 
@@ -63,9 +64,13 @@ function broadcastAlertToAndroids(message, imageData = null) {
       }
     });
   } else {
-    // Stocker l'alerte pour retry
-    console.log('Aucun Android connecté. Alerte stockée:', message);
-    pendingAlerts.push({ message, imageData, timestamp: Date.now() });
+    // Stocker l'alerte pour retry (limite à 100 alertes pour éviter surcharge)
+    if (pendingAlerts.length < 100) {
+      console.log('Aucun Android connecté. Alerte stockée:', message);
+      pendingAlerts.push({ message, imageData, timestamp: Date.now() });
+    } else {
+      console.warn('File d\'alertes pleine, alerte ignorée:', message);
+    }
   }
 }
 
@@ -76,12 +81,11 @@ function retryPendingAlerts() {
   // Supprimer les alertes trop anciennes (ex: > 1 heure)
   const now = Date.now();
   const maxAge = 60 * 60 * 1000; // 1 heure
-  pendingAlerts.filter(alert => now - alert.timestamp <= maxAge);
+  const validAlerts = pendingAlerts.filter(alert => now - alert.timestamp <= maxAge);
+  pendingAlerts.length = 0; // Vider la file
+  pendingAlerts.push(...validAlerts); // Restaurer les alertes valides
 
-  const alertsToSend = [...pendingAlerts];
-  pendingAlerts.length = 0; // Vider la file après copie
-
-  alertsToSend.forEach(({ message, imageData }) => {
+  validAlerts.forEach(({ message, imageData }) => {
     broadcastAlertToAndroids(message, imageData);
   });
 }
@@ -144,6 +148,7 @@ wss.on('connection', (socket, req) => {
   const registrationTimeout = setTimeout(() => {
     if (!socket.clientType && socket.readyState === WebSocket.OPEN) {
       console.log(`Client ${clientId} non enregistré après 10s, fermeture connexion`);
+      sendJsonMessage(socket, 'error', { message: 'Enregistrement requis' });
       socket.close(1008, 'Non enregistré');
     }
   }, 10000);
@@ -162,11 +167,20 @@ wss.on('connection', (socket, req) => {
   }, 30000);
 
   socket.on('message', (message) => {
+    // Vérifier si le client est enregistré
+    if (!socket.clientType && typeof message !== 'string') {
+      console.warn(`Données reçues d'un client non enregistré (ID: ${clientId}), fermeture connexion`);
+      sendJsonMessage(socket, 'error', { message: 'Enregistrement requis avant envoi de données' });
+      socket.close(1008, 'Non enregistré');
+      return;
+    }
+
     if (typeof message === 'string') {
       // Message JSON
       try {
         const data = JSON.parse(message);
         const type = data.type;
+        console.log(`Message JSON reçu de ${getClientType(socket)} (ID: ${clientId}): ${type}`);
 
         // Enregistrement du client
         if (type === 'register') {
@@ -205,6 +219,7 @@ wss.on('connection', (socket, req) => {
               sendJsonMessage(socket, cmd.type, cmd.params);
             }
           } else {
+            console.warn(`Type d'appareil inconnu: ${device} (ID: ${clientId})`);
             sendJsonMessage(socket, 'error', { message: `Type d'appareil inconnu: ${device}` });
             socket.close(1008, 'Type d\'appareil inconnu');
             return;
@@ -216,6 +231,7 @@ wss.on('connection', (socket, req) => {
         if (!socket.clientType) {
           console.warn(`Message reçu d'un client non enregistré (ID: ${clientId}): ${type}`);
           sendJsonMessage(socket, 'error', { message: 'Client non enregistré' });
+          socket.close(1008, 'Non enregistré');
           return;
         }
 
@@ -226,7 +242,7 @@ wss.on('connection', (socket, req) => {
             console.log(`Commande ${type} reçue de Android (ID: ${clientId}):`, params);
             distributeCommand(type, params, socket);
           } else {
-            console.warn(`Type de commande inconnu de Android: ${type}`);
+            console.warn(`Type de commande inconnu de Android: ${type} (ID: ${clientId})`);
             sendJsonMessage(socket, 'error', { message: `Type de commande inconnu: ${type}` });
           }
           return;
@@ -235,23 +251,23 @@ wss.on('connection', (socket, req) => {
         // Alertes depuis ESPs
         if (type === 'alert' && (socket.clientType === 'esp32-cam' || socket.clientType === 'esp32-standard')) {
           const msg = data.message || 'Alerte sans message';
-          console.log(`Alerte reçue de ${socket.clientType}: ${msg}`);
+          console.log(`Alerte reçue de ${socket.clientType} (ID: ${clientId}): ${msg}`);
           // Allumer la lampe sur l'autre ESP
           const otherEsps = socket.clientType === 'esp32-cam' ? clients.espStandards : clients.espCams;
+          const otherQueue = socket.clientType === 'esp32-cam' ? espStandardCommandsQueue : espCamCommandsQueue;
           otherEsps.forEach((otherEsp) => {
             if (otherEsp.readyState === WebSocket.OPEN) {
               sendJsonMessage(otherEsp, 'turn_on_light', { reason: 'alert_detected' });
             } else {
-              const queue = socket.clientType === 'esp32-cam' ? espStandardCommandsQueue : espCamCommandsQueue;
-              queue.push({ type: 'turn_on_light', params: { reason: 'alert_detected' } });
+              otherQueue.push({ type: 'turn_on_light', params: { reason: 'alert_detected' } });
             }
           });
           // Forward à Androids
           broadcastAlertToAndroids(msg);
         } else if (type === 'pong') {
-          console.log(`Pong reçu de ${socket.clientType}`);
+          console.log(`Pong reçu de ${socket.clientType} (ID: ${clientId})`);
         } else {
-          console.warn(`Message non géré de ${socket.clientType}: ${type}`);
+          console.warn(`Message non géré de ${socket.clientType} (ID: ${clientId}): ${type}`);
         }
       } catch (error) {
         console.error(`Erreur parsing JSON pour client ${clientId}:`, error.message);
@@ -264,6 +280,8 @@ wss.on('connection', (socket, req) => {
         broadcastAlertToAndroids('Photo capturée lors d\'une alerte', message);
       } else {
         console.error(`Image reçue d'un client non ESP-CAM (type: ${socket.clientType}, ID: ${clientId})`);
+        sendJsonMessage(socket, 'error', { message: 'Seuls les ESP32-CAM peuvent envoyer des images' });
+        socket.close(1008, 'Données binaires non autorisées');
       }
     }
   });
