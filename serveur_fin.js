@@ -15,7 +15,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// --- Stockage des clients (Utilisation de Map pour plusieurs clients Android si nécessaire) ---
+// --- Stockage des clients (Utilisation de Map pour plusieurs clients Android) ---
 const clients = {
     androids: new Map(),        // Map: clientId -> { socket, isAlive }
     espCams: new Map(),         // Map: clientId -> { socket, isAlive }
@@ -57,7 +57,6 @@ function broadcastEspStatus() {
         type: 'esp_status',
         espCam: espCamConnected,
         espStandard: espStandardConnected,
-        // La propriété 'connected' est maintenue pour la compatibilité avec votre code Android initial
         connected: espCamConnected || espStandardConnected 
     };
 
@@ -99,8 +98,10 @@ function distributeCommand(type, params, androidSocket) {
     }
     
     // 3. Réponse à l'Android
-    const message = `${type} envoyé. CAM: ${sentToCam ? 'OK' : 'Queue'}, STD: ${sentToStd ? 'OK' : 'Queue'}`;
-    sendJsonMessage(androidSocket, 'command_response', { success: true, message });
+    if (androidSocket) {
+        const message = `${type} envoyé. CAM: ${sentToCam ? 'OK' : 'Queue'}, STD: ${sentToStd ? 'OK' : 'Queue'}`;
+        sendJsonMessage(androidSocket, 'command_response', { success: true, message });
+    }
 }
 
 /**
@@ -134,15 +135,10 @@ wss.on('connection', (socket, req) => {
     socket.clientType = null;
     socket.isAlive = true; // Heartbeat
     
-    // Timeout pour l'enregistrement
-    const registrationTimeout = setTimeout(() => {
-        if (!socket.clientType && socket.readyState === WebSocket.OPEN) {
-            console.log(`Client ${clientId} non enregistré après 45s, fermeture connexion`);
-            socket.close(1000, 'Enregistrement requis');
-        }
-    }, 45000);
+    // ⚠️ Suppression du registrationTimeout qui fermait la connexion après 45s.
+    // La connexion reste ouverte, mais le client DOIT s'enregistrer pour être actif.
 
-    // Répondre au ping du serveur (OkHttp dans Android le gère automatiquement via le pong)
+    // Répondre au ping du serveur
     socket.on('pong', () => {
         socket.isAlive = true;
     });
@@ -179,9 +175,13 @@ wss.on('connection', (socket, req) => {
             
             // 1. Enregistrement
             if (type === 'register') {
-                clearTimeout(registrationTimeout);
                 const device = message.device;
                 socket.clientType = device;
+                
+                // Retrait des anciennes références avant d'ajouter la nouvelle (pour éviter les doublons)
+                clients.androids.delete(clientId);
+                clients.espCams.delete(clientId);
+                clients.espStandards.delete(clientId);
                 
                 if (device === 'android') {
                     clients.androids.set(clientId, { socket, isAlive: true });
@@ -191,12 +191,12 @@ wss.on('connection', (socket, req) => {
                 } else if (device === 'esp32-cam') {
                     clients.espCams.set(clientId, { socket, isAlive: true });
                     sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
-                    sendQueuedCommands(socket, true); // Envoi des commandes en attente
+                    sendQueuedCommands(socket, true);
                     broadcastEspStatus();
                 } else if (device === 'esp32-standard') {
                     clients.espStandards.set(clientId, { socket, isAlive: true });
                     sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
-                    sendQueuedCommands(socket, false); // Envoi des commandes en attente
+                    sendQueuedCommands(socket, false);
                     broadcastEspStatus();
                 } else {
                     socket.close(1000, 'Type de dispositif inconnu');
@@ -206,24 +206,25 @@ wss.on('connection', (socket, req) => {
             }
             
             // Si pas encore enregistré, ignorer les autres messages
-            if (!socket.clientType) return;
+            if (!socket.clientType) {
+                console.warn(`Message reçu avant enregistrement. Type: ${type}`);
+                return;
+            }
             
-            // 2. Commandes Android (network_config, security_config)
+            // 2. Commandes Android
             if (socket.clientType === 'android' && (type === 'network_config' || type === 'security_config')) {
                 distributeCommand(type, message.params || {}, socket);
                 return;
             }
             
-            // 3. Alertes ESP (pour intrusion/etc.)
+            // 3. Alertes ESP
             if ((socket.clientType === 'esp32-cam' || socket.clientType === 'esp32-standard') && type === 'alert') {
                 console.log(`Alerte reçue de ${socket.clientType}: ${message.message}`);
                 
-                // Transférer à tous les Androids
                 clients.androids.forEach(client => {
                     sendJsonMessage(client.socket, 'alert', { message: message.message });
                 });
                 
-                // Envoyer la commande d'allumage de la lampe à ESP-Standard (même si l'alerte vient de lui)
                 distributeCommand('turn_on_light', { reason: 'alert_detected' }, null);
                 return;
             }
@@ -242,8 +243,6 @@ wss.on('connection', (socket, req) => {
     });
 
     socket.on('close', (code, reason) => {
-        clearTimeout(registrationTimeout);
-
         const type = socket.clientType;
         if (type === 'android') {
             clients.androids.delete(clientId);
@@ -262,17 +261,17 @@ wss.on('connection', (socket, req) => {
     });
 });
 
-// --- Gestion du Heartbeat (Ping/Pong) pour la Déconnexion ---
+// --- Gestion du Heartbeat (Ping/Pong) ---
 
 const pingInterval = setInterval(() => {
     wss.clients.forEach(socket => {
+        // Le client n'a pas répondu au ping précédent (isAlive est encore false)
         if (!socket.isAlive) {
             console.log(`Timeout de client ${socket.clientId} (${socket.clientType}), fermeture forcée.`);
-            return socket.terminate(); // Terminer la connexion si le pong n'a pas été reçu
+            return socket.terminate();
         }
 
         socket.isAlive = false;
-        // La méthode `ping` envoie un ping. L'Android (OkHttp) doit répondre par un pong.
         socket.ping(); 
     });
 }, PING_INTERVAL_MS);
