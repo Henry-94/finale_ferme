@@ -53,7 +53,7 @@ wss.on('connection', (socket, req) => {
     const clientIp = req.socket.remoteAddress;
     console.log(`🔗 Nouveau client connecté depuis ${clientIp} (ID: ${clientId}, Port: ${req.socket.remotePort})`);
 
-    // Timeout pour l'enregistrement (augmenté à 30s pour tolérance)
+    // Timeout pour l'enregistrement (30s pour tolérer les délais réseau)
     const registrationTimeout = setTimeout(() => {
         if (!socket.clientType) {
             console.log(`Client ${clientId} non enregistré après 30s, fermeture connexion`);
