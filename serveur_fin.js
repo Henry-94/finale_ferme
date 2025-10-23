@@ -64,7 +64,7 @@ function broadcastAlertToAndroids(message, imageData = null) {
       }
     });
   } else {
-    // Stocker l'alerte pour retry (limite à 100 alertes pour éviter surcharge)
+    // Stocker l'alerte pour retry (limite à 100 alertes)
     if (pendingAlerts.length < 100) {
       console.log('Aucun Android connecté. Alerte stockée:', message);
       pendingAlerts.push({ message, imageData, timestamp: Date.now() });
@@ -147,11 +147,11 @@ wss.on('connection', (socket, req) => {
   // Définir un délai pour l'enregistrement
   const registrationTimeout = setTimeout(() => {
     if (!socket.clientType && socket.readyState === WebSocket.OPEN) {
-      console.log(`Client ${clientId} non enregistré après 10s, fermeture connexion`);
+      console.log(`Client ${clientId} non enregistré après 15s, fermeture connexion`);
       sendJsonMessage(socket, 'error', { message: 'Enregistrement requis' });
       socket.close(1008, 'Non enregistré');
     }
-  }, 10000);
+  }, 15000);
 
   // Ping périodique
   const pingInterval = setInterval(() => {
@@ -168,11 +168,70 @@ wss.on('connection', (socket, req) => {
 
   socket.on('message', (message) => {
     // Vérifier si le client est enregistré
-    if (!socket.clientType && typeof message !== 'string') {
-      console.warn(`Données reçues d'un client non enregistré (ID: ${clientId}), fermeture connexion`);
-      sendJsonMessage(socket, 'error', { message: 'Enregistrement requis avant envoi de données' });
-      socket.close(1008, 'Non enregistré');
-      return;
+    if (!socket.clientType) {
+      if (typeof message === 'string') {
+        try {
+          const data = JSON.parse(message);
+          const type = data.type;
+          console.log(`Message JSON reçu avant enregistrement (ID: ${clientId}): ${type}`);
+          
+          // Traiter uniquement le message register
+          if (type === 'register') {
+            clearTimeout(registrationTimeout); // Annuler le timeout
+            const device = data.device;
+            socket.clientType = device;
+            if (device === 'android') {
+              clients.androids.set(clientId, socket);
+              console.log('✅ Android connecté');
+              sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
+              // Envoyer les statuts actuels des ESPs
+              sendJsonMessage(socket, 'esp_status', {
+                espCam: clients.espCams.length > 0,
+                espStandard: clients.espStandards.length > 0
+              });
+              // Retenter l'envoi des alertes en attente
+              retryPendingAlerts();
+            } else if (device === 'esp32-cam') {
+              clients.espCams.push(socket);
+              console.log('✅ ESP32-CAM connecté');
+              sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
+              broadcastEspStatus('espCam', true);
+              // Envoyer les commandes en attente
+              while (espCamCommandsQueue.length > 0) {
+                const cmd = espCamCommandsQueue.shift();
+                sendJsonMessage(socket, cmd.type, cmd.params);
+              }
+            } else if (device === 'esp32-standard') {
+              clients.espStandards.push(socket);
+              console.log('✅ ESP32-Standard connecté');
+              sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
+              broadcastEspStatus('espStandard', true);
+              // Envoyer les commandes en attente
+              while (espStandardCommandsQueue.length > 0) {
+                const cmd = espStandardCommandsQueue.shift();
+                sendJsonMessage(socket, cmd.type, cmd.params);
+              }
+            } else {
+              console.warn(`Type d'appareil inconnu: ${device} (ID: ${clientId})`);
+              sendJsonMessage(socket, 'error', { message: `Type d'appareil inconnu: ${device}` });
+              socket.close(1008, 'Type d\'appareil inconnu');
+            }
+            return;
+          } else {
+            console.warn(`Message non-register reçu avant enregistrement (ID: ${clientId}): ${type}`);
+            sendJsonMessage(socket, 'error', { message: 'Enregistrement requis avant autres messages' });
+            return;
+          }
+        } catch (error) {
+          console.error(`Erreur parsing JSON avant enregistrement (ID: ${clientId}):`, error.message);
+          sendJsonMessage(socket, 'error', { message: 'Message JSON invalide' });
+          return;
+        }
+      } else if (message instanceof Buffer) {
+        console.warn(`Données binaires reçues avant enregistrement (ID: ${clientId}), taille: ${message.length} bytes`);
+        sendJsonMessage(socket, 'error', { message: 'Enregistrement requis avant envoi de données binaires' });
+        return;
+      }
     }
 
     if (typeof message === 'string') {
@@ -182,65 +241,14 @@ wss.on('connection', (socket, req) => {
         const type = data.type;
         console.log(`Message JSON reçu de ${getClientType(socket)} (ID: ${clientId}): ${type}`);
 
-        // Enregistrement du client
-        if (type === 'register') {
-          clearTimeout(registrationTimeout); // Annuler le timeout
-          const device = data.device;
-          socket.clientType = device;
-          if (device === 'android') {
-            clients.androids.set(clientId, socket);
-            console.log('✅ Android connecté');
-            sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
-            // Envoyer les statuts actuels des ESPs
-            sendJsonMessage(socket, 'esp_status', {
-              espCam: clients.espCams.length > 0,
-              espStandard: clients.espStandards.length > 0
-            });
-            // Retenter l'envoi des alertes en attente
-            retryPendingAlerts();
-          } else if (device === 'esp32-cam') {
-            clients.espCams.push(socket);
-            console.log('✅ ESP32-CAM connecté');
-            sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
-            broadcastEspStatus('espCam', true);
-            // Envoyer les commandes en attente
-            while (espCamCommandsQueue.length > 0) {
-              const cmd = espCamCommandsQueue.shift();
-              sendJsonMessage(socket, cmd.type, cmd.params);
-            }
-          } else if (device === 'esp32-standard') {
-            clients.espStandards.push(socket);
-            console.log('✅ ESP32-Standard connecté');
-            sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
-            broadcastEspStatus('espStandard', true);
-            // Envoyer les commandes en attente
-            while (espStandardCommandsQueue.length > 0) {
-              const cmd = espStandardCommandsQueue.shift();
-              sendJsonMessage(socket, cmd.type, cmd.params);
-            }
-          } else {
-            console.warn(`Type d'appareil inconnu: ${device} (ID: ${clientId})`);
-            sendJsonMessage(socket, 'error', { message: `Type d'appareil inconnu: ${device}` });
-            socket.close(1008, 'Type d\'appareil inconnu');
-            return;
-          }
-          return;
-        }
-
-        // Vérifier si le client est enregistré
-        if (!socket.clientType) {
-          console.warn(`Message reçu d'un client non enregistré (ID: ${clientId}): ${type}`);
-          sendJsonMessage(socket, 'error', { message: 'Client non enregistré' });
-          socket.close(1008, 'Non enregistré');
-          return;
-        }
-
         // Commandes depuis Android
         if (socket.clientType === 'android') {
           if (type === 'network_config' || type === 'security_config') {
             const params = data.params || {};
             console.log(`Commande ${type} reçue de Android (ID: ${clientId}):`, params);
             distributeCommand(type, params, socket);
+          } else if (type === 'pong') {
+            console.log(`Pong reçu de ${socket.clientType} (ID: ${clientId})`);
           } else {
             console.warn(`Type de commande inconnu de Android: ${type} (ID: ${clientId})`);
             sendJsonMessage(socket, 'error', { message: `Type de commande inconnu: ${type}` });
@@ -281,7 +289,6 @@ wss.on('connection', (socket, req) => {
       } else {
         console.error(`Image reçue d'un client non ESP-CAM (type: ${socket.clientType}, ID: ${clientId})`);
         sendJsonMessage(socket, 'error', { message: 'Seuls les ESP32-CAM peuvent envoyer des images' });
-        socket.close(1008, 'Données binaires non autorisées');
       }
     }
   });
