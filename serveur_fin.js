@@ -2,265 +2,223 @@ const WebSocket = require('ws');
 const http = require('http');
 const { v4: uuidv4 } = require('uuid');
 
-// --- Configuration ---
 const PORT = process.env.PORT || 10000;
-const MAX_QUEUE_SIZE = 50; // Limite de taille pour les files d'attente de photos
 
-// --- Serveur HTTP et WebSocket ---
-// Un serveur HTTP simple pour les vérifications de statut
+// Créer un serveur HTTP pour gérer les requêtes WebSocket
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('Serveur WebSocket actif\n');
 });
 
-// Le serveur WebSocket
+// Créer un serveur WebSocket
 const wss = new WebSocket.Server({ server });
 
-// --- Stockage des clients (Utilisation de Map pour plusieurs Androids) ---
+// Stockage des clients par type
 const clients = {
-    // Androids: Map<clientId, { socket }> pour supporter plusieurs téléphones
-    androids: new Map(),        
-    // ESPs: un seul client à la fois pour le moment
-    espCam: null,         
-    espStandard: null     
+    android: null,
+    espCam: null,
+    espStandard: null
 };
 
-// --- Files d'attente (Stocke les données binaires des photos pour Android déconnecté) ---
-const photoQueue = []; 
+// File d'attente pour les photos non envoyées à l'application Android
+const photoQueue = [];
 
-// --- Statut des ESP ---
+// Statut des ESP
 let espCamConnected = false;
 let espStandardConnected = false;
 
-// --- Fonctions utilitaires ---
-
-/**
- * Envoie un message JSON à un socket spécifique.
- */
-function sendJsonMessage(socket, type, data = {}) {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-        try {
-            const message = JSON.stringify({ type, ...data });
-            socket.send(message);
-            return true;
-        } catch (e) {
-            console.error(`Erreur JSON/envoi à ${socket.clientId}:`, e.message);
-            return false;
-        }
-    }
-    return false;
-}
-
-/**
- * Envoie le statut de connexion des ESPs à TOUS les Androids connectés (Exigence 4).
- */
 function broadcastEspStatus() {
-    espCamConnected = clients.espCam !== null;
-    espStandardConnected = clients.espStandard !== null;
-
-    const statusMessage = {
-        type: 'esp_status',
-        espCam: espCamConnected,
-        espStandard: espStandardConnected,
-        connected: espCamConnected || espStandardConnected 
-    };
-
-    clients.androids.forEach(client => {
-        sendJsonMessage(client.socket, statusMessage.type, statusMessage);
-    });
-}
-
-/**
- * Envoie une commande de l'Android aux ESP32 (Exigence 6).
- */
-function distributeCommand(type, params, androidSocket) {
-    let sentToCam = false;
-    let sentToStd = false;
-    const messageToSend = { type, params };
-
-    // Envoyer à ESP32-CAM (pour network_config et security_config)
-    if (clients.espCam && clients.espCam.readyState === WebSocket.OPEN) {
-        clients.espCam.send(JSON.stringify(messageToSend));
-        sentToCam = true;
-    }
-
-    // Envoyer à ESP32-Standard (pour network_config et security_config)
-    if (clients.espStandard && clients.espStandard.readyState === WebSocket.OPEN) {
-        clients.espStandard.send(JSON.stringify(messageToSend));
-        sentToStd = true;
-    }
-    
-    // Réponse à l'Android
-    if (androidSocket && androidSocket.readyState === WebSocket.OPEN) {
-        const camStatus = sentToCam ? 'OK' : 'Non connecté';
-        const stdStatus = sentToStd ? 'OK' : 'Non connecté';
-        const msg = `${type} envoyé. CAM: ${camStatus}, STD: ${stdStatus}`;
-
-        sendJsonMessage(androidSocket, 'command_response', { success: true, message: msg });
+    if (clients.android && clients.android.readyState === WebSocket.OPEN) {
+        const statusMessage = {
+            type: 'esp_status',
+            espCam: espCamConnected,
+            espStandard: espStandardConnected,
+            connected: espCamConnected // Ajouté pour compatibilité avec WebSocketManager
+        };
+        clients.android.send(JSON.stringify(statusMessage));
+        console.log(`Message envoyé à Android: ${JSON.stringify(statusMessage)}`);
     }
 }
 
-/**
- * Envoie un message JSON spécifique à l'ESP Standard (pour allumer la lampe, Exigence 2 et 5).
- */
 function sendToEspStandard(message) {
     if (clients.espStandard && clients.espStandard.readyState === WebSocket.OPEN) {
         clients.espStandard.send(JSON.stringify(message));
+        console.log(`Message envoyé à ESP-Standard: ${JSON.stringify(message)}`);
     }
 }
-
-/**
- * Transfère les données binaires (image) à tous les Androids (Exigence 2 et 3).
- * @param {Buffer} data - Données d'image binaires
- */
-function broadcastImage(data) {
-    let sentToAndroid = false;
-    
-    // Transfère l'image à tous les Androids connectés
-    clients.androids.forEach(client => {
-        if (client.socket.readyState === WebSocket.OPEN) {
-            client.socket.send(data);
-            sentToAndroid = true;
-        }
-    });
-
-    // Mise en file d'attente si aucun Android n'est connecté (Exigence 3)
-    if (!sentToAndroid && photoQueue.length < MAX_QUEUE_SIZE) {
-        photoQueue.push(data); 
-        console.log(`Android non connecté, photo mise en file d'attente (${photoQueue.length}/${MAX_QUEUE_SIZE}).`);
-    }
-
-    // Envoyer commande pour allumer la lampe à ESP-Standard (Exigence 2)
-    sendToEspStandard({ type: 'turn_on_light' });
-}
-
-/**
- * Envoie toutes les photos en file d'attente à l'Android nouvellement connecté (Exigence 3).
- */
-function sendQueuedPhotos(androidSocket) {
-    let count = 0;
-    while (photoQueue.length > 0) {
-        const photo = photoQueue.shift();
-        androidSocket.send(photo);
-        count++;
-    }
-    if (count > 0) {
-         console.log(`${count} photo(s) en file d'attente envoyée(s) à Android.`);
-    }
-}
-
-// --- Gestion des connexions WebSocket ---
 
 wss.on('connection', (socket, req) => {
     const clientId = uuidv4();
     socket.clientId = clientId;
     socket.clientType = null;
-    
-    // Le registrationTimeout a été retiré pour la stabilité sur Render et éviter les déconnexions forcées.
+    const clientIp = req.socket.remoteAddress;
+    const clientPort = req.socket.remotePort;
+    console.log(`🔗 Nouveau client connecté depuis ${clientIp}:${clientPort} (ID: ${clientId})`);
+
+    // Timeout pour l'enregistrement (45s pour tolérer les délais réseau)
+    const registrationTimeout = setTimeout(() => {
+        if (!socket.clientType) {
+            console.log(`Client ${clientId} non enregistré après 45s, fermeture connexion`);
+            socket.send(JSON.stringify({ type: 'error', message: 'Enregistrement requis' }));
+            socket.close(1000, 'Enregistrement requis');
+        }
+    }, 45000);
 
     socket.on('message', (data) => {
         try {
             let message;
             let isBinary = Buffer.isBuffer(data);
 
-            // 1. Traitement des données binaires (Image ESP-CAM - Exigence 2)
+            // Si les données sont binaires, tenter de les convertir en texte
             if (isBinary) {
-                if (socket.clientType !== 'esp32-cam') return; 
-                console.log(`Photo reçue de ESP-CAM (ID: ${clientId}), taille: ${data.length} bytes`);
-                broadcastImage(data); // Relais à Android et gestion file d'attente/lampe
-                return;
+                const textData = data.toString('utf8');
+                try {
+                    // Vérifier si les données binaires sont du JSON valide
+                    message = JSON.parse(textData);
+                    console.log(`Message JSON reçu sous forme binaire de ${socket.clientType || 'Unknown'} (ID: ${clientId}, IP: ${clientIp}:${clientPort}): ${textData}`);
+                } catch (e) {
+                    // Si ce n'est pas du JSON, supposer que c'est une photo de l'ESP32-CAM
+                    if (socket.clientType === 'esp32-cam') {
+                        console.log(`Photo reçue de ESP-CAM (ID: ${clientId}, IP: ${clientIp}:${clientPort}), taille: ${data.length} bytes`);
+                        // Transférer à l'application Android si connectée
+                        if (clients.android && clients.android.readyState === WebSocket.OPEN) {
+                            clients.android.send(data);
+                            console.log(`Photo transférée à Android (ID: ${clients.android.clientId})`);
+                        } else {
+                            // Mettre en file d'attente si Android non connecté
+                            photoQueue.push(data);
+                            console.log(`Android non connecté, photo mise en file d'attente (taille: ${data.length} bytes)`);
+                        }
+                        // Envoyer commande pour allumer la lampe à ESP-Standard
+                        sendToEspStandard({ type: 'turn_on_light' });
+                        return;
+                    }
+                    console.log(`Données binaires non-JSON reçues avant enregistrement (ID: ${clientId}, IP: ${clientIp}:${clientPort}), taille: ${data.length} bytes, contenu: ${data.toString('hex')}`);
+                    socket.send(JSON.stringify({ type: 'error', message: 'Enregistrement requis avant envoi de données binaires' }));
+                    return;
+                }
+            } else {
+                // Données reçues comme texte
+                message = JSON.parse(data.toString());
+                console.log(`Message JSON reçu de ${socket.clientType || 'Unknown'} (ID: ${clientId}, IP: ${clientIp}:${clientPort}): ${JSON.stringify(message)}`);
             }
 
-            // 2. Traitement des messages JSON
-            message = JSON.parse(data.toString());
-            const type = message.type;
-            
-            // Enregistrement
-            if (type === 'register') {
+            // Traiter les messages JSON
+            if (message.type === 'register') {
+                clearTimeout(registrationTimeout);
                 const device = message.device;
                 socket.clientType = device;
-                
+
                 if (device === 'android') {
-                    // Supporte plusieurs Androids
-                    clients.androids.set(clientId, { socket }); 
-                    sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
-                    sendQueuedPhotos(socket); // Envoi des photos en attente (Exigence 3)
+                    clients.android = socket;
+                    console.log('✅ Android connecté');
+                    socket.send(JSON.stringify({ type: 'registered', message: 'Enregistrement réussi' }));
+                    // Envoyer le statut des ESP
                     broadcastEspStatus();
+                    // Envoyer les photos en file d'attente
+                    while (photoQueue.length > 0) {
+                        const photo = photoQueue.shift();
+                        socket.send(photo);
+                        console.log(`Photo en file d'attente envoyée à Android (taille: ${photo.length} bytes)`);
+                    }
                 } else if (device === 'esp32-cam') {
                     clients.espCam = socket;
-                    broadcastEspStatus(); 
-                    sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
+                    espCamConnected = true;
+                    console.log('✅ ESP32-CAM connecté');
+                    socket.send(JSON.stringify({ type: 'registered', message: 'Enregistrement réussi' }));
+                    broadcastEspStatus();
                 } else if (device === 'esp32-standard') {
                     clients.espStandard = socket;
+                    espStandardConnected = true;
+                    console.log('✅ ESP32-Standard connecté');
+                    socket.send(JSON.stringify({ type: 'registered', message: 'Enregistrement réussi' }));
                     broadcastEspStatus();
-                    sendJsonMessage(socket, 'registered', { message: 'Enregistrement réussi' });
                 } else {
+                    console.log(`Type de dispositif inconnu: ${device}`);
+                    socket.send(JSON.stringify({ type: 'error', message: 'Type de dispositif inconnu' }));
                     socket.close(1000, 'Type de dispositif inconnu');
                 }
-                console.log(`Client ID ${clientId} enregistré comme: ${device}`);
-                return;
-            }
-            
-            // Si pas encore enregistré, ignorer les autres messages
-            if (!socket.clientType) {
-                console.warn(`Message reçu avant enregistrement. Type: ${type}`);
-                return;
-            }
-            
-            // Alertes ESP (Exigence 5)
-            if ((socket.clientType === 'esp32-cam' || socket.clientType === 'esp32-standard') && type === 'alert') {
-                console.log(`Alerte reçue de ${socket.clientType}: ${message.message}`);
-                
-                // Relais à tous les Androids
-                clients.androids.forEach(client => {
-                    sendJsonMessage(client.socket, 'alert', { message: message.message });
-                });
-                
-                // Envoi commande pour allumer la lampe (Exigence 5)
+            } else if (!socket.clientType) {
+                console.log(`Message JSON reçu avant enregistrement (ID: ${clientId}, IP: ${clientIp}:${clientPort}): ${JSON.stringify(message)}`);
+                socket.send(JSON.stringify({ type: 'error', message: 'Enregistrement requis avant envoi de messages' }));
+            } else if (message.type === 'alert' && (socket.clientType === 'esp32-cam' || socket.clientType === 'esp32-standard')) {
+                console.log(`Alerte reçue de ${socket.clientType} (ID: ${clientId}, IP: ${clientIp}:${clientPort}): ${message.message}`);
+                // Transférer à l'application Android
+                if (clients.android && clients.android.readyState === WebSocket.OPEN) {
+                    clients.android.send(JSON.stringify(message));
+                    console.log(`Alerte transférée à Android (ID: ${clients.android.clientId})`);
+                }
+                // Envoyer commande pour allumer la lampe à ESP-Standard
                 sendToEspStandard({ type: 'turn_on_light' });
-                return;
+            } else if (message.type === 'network_config' && socket.clientType === 'android') {
+                console.log(`Commande network_config reçue de Android (ID: ${clientId}, IP: ${clientIp}:${clientPort}): ${JSON.stringify(message.params)}`);
+                // Transférer à ESP32-CAM et ESP32-Standard
+                if (clients.espCam && clients.espCam.readyState === WebSocket.OPEN) {
+                    clients.espCam.send(JSON.stringify(message));
+                    console.log(`Commande network_config envoyée à ESP-CAM (ID: ${clients.espCam.clientId})`);
+                }
+                if (clients.espStandard && clients.espStandard.readyState === WebSocket.OPEN) {
+                    clients.espStandard.send(JSON.stringify(message));
+                    console.log(`Commande network_config envoyée à ESP-Standard (ID: ${clients.espStandard.clientId})`);
+                }
+                // Confirmer à l'application Android
+                socket.send(JSON.stringify({
+                    type: 'command_response',
+                    success: true,
+                    message: 'network_config envoyé. CAM: ' + (clients.espCam ? 'Queue' : 'Non connecté') + ', STD: ' + (clients.espStandard ? 'Queue' : 'Non connecté')
+                }));
+            } else if (message.type === 'security_config' && socket.clientType === 'android') {
+                console.log(`Commande security_config reçue de Android (ID: ${clientId}, IP: ${clientIp}:${clientPort}): ${JSON.stringify(message.params)}`);
+                // Transférer à ESP32-CAM et ESP32-Standard
+                if (clients.espCam && clients.espCam.readyState === WebSocket.OPEN) {
+                    clients.espCam.send(JSON.stringify(message));
+                    console.log(`Commande security_config envoyée à ESP-CAM (ID: ${clients.espCam.clientId})`);
+                }
+                if (clients.espStandard && clients.espStandard.readyState === WebSocket.OPEN) {
+                    clients.espStandard.send(JSON.stringify(message));
+                    console.log(`Commande security_config envoyée à ESP-Standard (ID: ${clients.espStandard.clientId})`);
+                }
+                // Confirmer à l'application Android
+                socket.send(JSON.stringify({
+                    type: 'command_response',
+                    success: true,
+                    message: 'security_config envoyé. CAM: ' + (clients.espCam ? 'Queue' : 'Non connecté') + ', STD: ' + (clients.espStandard ? 'Queue' : 'Non connecté')
+                }));
+            } else if (message.type === 'ping') {
+                socket.send(JSON.stringify({ type: 'pong' }));
+                console.log(`Pong envoyé à ${socket.clientType} (ID: ${clientId}, IP: ${clientIp}:${clientPort})`);
+            } else {
+                console.log(`Message non géré de ${socket.clientType} (ID: ${clientId}, IP: ${clientIp}:${clientPort}): ${JSON.stringify(message)}`);
+                socket.send(JSON.stringify({ type: 'error', message: 'Type de message inconnu' }));
             }
-            
-            // Commandes Android (Exigence 6)
-            if (socket.clientType === 'android' && (type === 'network_config' || type === 'security_config')) {
-                distributeCommand(type, message.params || {}, socket);
-                return;
-            }
-            
-            // Heartbeat (Ping/Pong) pour maintenir la connexion active
-            if (type === 'ping') {
-                sendJsonMessage(socket, 'pong');
-                return;
-            }
-
-            console.log(`Message non géré de ${socket.clientType}: ${JSON.stringify(message)}`);
-
         } catch (error) {
-            console.error(`Erreur traitement message (ID: ${clientId}):`, error.message);
+            console.error(`Erreur traitement message (ID: ${clientId}, IP: ${clientIp}:${clientPort}):`, error);
+            socket.send(JSON.stringify({ type: 'error', message: 'Erreur serveur: ' + error.message }));
         }
     });
 
     socket.on('close', (code, reason) => {
-        const type = socket.clientType;
-        
-        if (type === 'android') {
-            clients.androids.delete(clientId); 
-        } else if (type === 'esp32-cam') {
+        console.log(`Client déconnecté (ID: ${clientId}, Type: ${socket.clientType || 'Unknown'}, IP: ${clientIp}:${clientPort}, Code: ${code}, Raison: ${reason.toString()})`);
+        if (socket.clientType === 'android') {
+            clients.android = null;
+        } else if (socket.clientType === 'esp32-cam') {
             clients.espCam = null;
-            broadcastEspStatus(); // Informe Androids de la déconnexion
-        } else if (type === 'esp32-standard') {
+            espCamConnected = false;
+            broadcastEspStatus();
+        } else if (socket.clientType === 'esp32-standard') {
             clients.espStandard = null;
-            broadcastEspStatus(); // Informe Androids de la déconnexion
+            espStandardConnected = false;
+            broadcastEspStatus();
         }
-        console.log(`Client déconnecté (ID: ${clientId}, Type: ${type || 'Unknown'}, Code: ${code})`);
+        clearTimeout(registrationTimeout);
     });
 
     socket.on('error', (error) => {
-        console.error(`Erreur WebSocket (ID: ${clientId}):`, error);
+        console.error(`Erreur WebSocket (ID: ${clientId}, IP: ${clientIp}:${clientPort}):`, error);
     });
 });
 
 // Lancer le serveur
 server.listen(PORT, () => {
-    console.log(`Serveur actif sur port ${PORT}. Écoute HTTP et WS.`);
+    console.log(`🚀 Serveur actif sur port ${PORT}. Écoute HTTP et WS.`);
 });
