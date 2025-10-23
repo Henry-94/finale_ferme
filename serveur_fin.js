@@ -14,11 +14,11 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// --- Stockage des clients (Utilisation de Map pour les Androids) ---
+// --- Stockage des clients (Utilisation de Map pour les Androids : support multi-clients) ---
 const clients = {
     // Permet plusieurs téléphones Androids
     androids: new Map(),        
-    // ESPs: une seule instance à la fois (pour l'instant)
+    // ESPs: une seule instance à la fois (ajustable au besoin)
     espCam: null,         
     espStandard: null     
 };
@@ -43,7 +43,7 @@ function broadcastEspStatus() {
         type: 'esp_status',
         espCam: espCamConnected,
         espStandard: espStandardConnected,
-        connected: espCamConnected || espStandardConnected // Reste pour compatibilité
+        connected: espCamConnected || espStandardConnected 
     };
 
     clients.androids.forEach(client => {
@@ -63,7 +63,7 @@ function sendToEspStandard(message) {
 }
 
 /**
- * Transfère les données binaires (image) à tous les Androids (Exigence: Photo/Alerte transférée).
+ * Transfère les données binaires (image) à tous les Androids.
  * Gère la file d'attente et la commande de lampe (Exigence: Lampe auto + Tenter toujours d'envoyer).
  * @param {Buffer} data - Données d'image binaires
  */
@@ -113,14 +113,14 @@ wss.on('connection', (socket, req) => {
     socket.clientType = null;
     const clientIp = req.socket.remoteAddress;
     
-    // ⚠️ SUPPRESSION DU registrationTimeout pour la stabilité et la robustesse
+    // Le registrationTimeout a été retiré pour la stabilité
 
     socket.on('message', (data) => {
         try {
             let message;
             let isBinary = Buffer.isBuffer(data);
 
-            // 1. Traitement des données binaires (Image ESP-CAM - Exigence: Photo binaire)
+            // 1. Traitement des données binaires (Image ESP-CAM)
             if (isBinary) {
                 if (socket.clientType !== 'esp32-cam') return; 
                 console.log(`Photo reçue de ESP-CAM (ID: ${clientId}), taille: ${data.length} bytes`);
@@ -164,7 +164,7 @@ wss.on('connection', (socket, req) => {
                 return;
             }
             
-            // Alertes ESP (Exigence: Alerte transférée + Lampe auto)
+            // Alertes ESP (ESP-CAM et ESP-Standard)
             if ((socket.clientType === 'esp32-cam' || socket.clientType === 'esp32-standard') && type === 'alert') {
                 console.log(`Alerte reçue de ${socket.clientType}: ${message.message}`);
                 
@@ -180,13 +180,14 @@ wss.on('connection', (socket, req) => {
                 return;
             }
             
-            // Commandes Android (Exigence: network_config et security_config)
+            // Commandes Android (network_config et security_config)
             if (socket.clientType === 'android' && (type === 'network_config' || type === 'security_config')) {
-                // Transférer à ESP32-CAM et ESP32-Standard
+                console.log(`Commande ${type} reçue de Android`);
                 const params = message.params || {};
                 let sentToCam = false;
                 let sentToStd = false;
                 
+                // Transfert aux deux ESPs
                 if (clients.espCam && clients.espCam.readyState === WebSocket.OPEN) {
                     clients.espCam.send(JSON.stringify(message));
                     sentToCam = true;
@@ -196,11 +197,10 @@ wss.on('connection', (socket, req) => {
                     sentToStd = true;
                 }
                 
-                // Confirmer à l'application Android
+                // Confirmation à l'application Android
                 socket.send(JSON.stringify({
                     type: 'command_response',
                     success: true,
-                    // Mise à jour de la réponse pour être plus clair
                     message: `${type} envoyé. CAM: ${sentToCam ? 'OK' : 'Non connecté'}, STD: ${sentToStd ? 'OK' : 'Non connecté'}`
                 }));
                 return;
