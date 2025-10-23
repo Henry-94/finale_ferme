@@ -4,7 +4,6 @@ const { v4: uuidv4 } = require('uuid');
 
 // --- Configuration ---
 const PORT = process.env.PORT || 10000;
-const PING_INTERVAL_MS = 30000; // Intervalle de ping/pong pour maintenir la connexion active
 const MAX_QUEUE_SIZE = 50; // Limite de taille pour les files d'attente
 
 // --- Serveur HTTP et WebSocket ---
@@ -133,13 +132,15 @@ wss.on('connection', (socket, req) => {
     const clientId = uuidv4();
     socket.clientId = clientId;
     socket.clientType = null;
-    socket.isAlive = true; // Heartbeat
+    socket.isAlive = true; // Conserver 'isAlive' pour la gestion interne (si besoin)
     
-    // ⚠️ Suppression du registrationTimeout qui fermait la connexion après 45s.
-    // La connexion reste ouverte, mais le client DOIT s'enregistrer pour être actif.
+    //  Heartbeat serveur désactivé. Le client Android doit envoyer des PING.
 
-    // Répondre au ping du serveur
+    // Gère le PONG si le client Android envoie un PING
     socket.on('pong', () => {
+        // OkHttp gère le pong en réponse au ping du serveur.
+        // Si vous utilisez un ping manuel client, ce 'pong' n'est pas nécessaire ici.
+        // Mais nous le gardons par sécurité.
         socket.isAlive = true;
     });
 
@@ -178,7 +179,7 @@ wss.on('connection', (socket, req) => {
                 const device = message.device;
                 socket.clientType = device;
                 
-                // Retrait des anciennes références avant d'ajouter la nouvelle (pour éviter les doublons)
+                // Retrait des anciennes références avant d'ajouter la nouvelle
                 clients.androids.delete(clientId);
                 clients.espCams.delete(clientId);
                 clients.espStandards.delete(clientId);
@@ -201,7 +202,7 @@ wss.on('connection', (socket, req) => {
                 } else {
                     socket.close(1000, 'Type de dispositif inconnu');
                 }
-                console.log(`✅ Client ID ${clientId} enregistré comme: ${device}`);
+                console.log(`Client ID ${clientId} enregistré comme: ${device}`);
                 return;
             }
             
@@ -229,7 +230,7 @@ wss.on('connection', (socket, req) => {
                 return;
             }
             
-            // 4. Ping/Pong
+            // 4. Ping/Pong (Répondre au ping manuel du client Android)
             if (type === 'ping') {
                 sendJsonMessage(socket, 'pong');
                 return;
@@ -253,7 +254,7 @@ wss.on('connection', (socket, req) => {
             clients.espStandards.delete(clientId);
             broadcastEspStatus();
         }
-        console.log(`💔 Client déconnecté (ID: ${clientId}, Type: ${type || 'Unknown'}, Code: ${code})`);
+        console.log(`Client déconnecté (ID: ${clientId}, Type: ${type || 'Unknown'}, Code: ${code})`);
     });
 
     socket.on('error', (error) => {
@@ -261,26 +262,13 @@ wss.on('connection', (socket, req) => {
     });
 });
 
-// --- Gestion du Heartbeat (Ping/Pong) ---
+// --- Désactivation du Heartbeat Côté Serveur ---
 
-const pingInterval = setInterval(() => {
-    wss.clients.forEach(socket => {
-        // Le client n'a pas répondu au ping précédent (isAlive est encore false)
-        if (!socket.isAlive) {
-            console.log(`Timeout de client ${socket.clientId} (${socket.clientType}), fermeture forcée.`);
-            return socket.terminate();
-        }
-
-        socket.isAlive = false;
-        socket.ping(); 
-    });
-}, PING_INTERVAL_MS);
-
-wss.on('close', () => {
-    clearInterval(pingInterval);
-});
+// Commenté pour s'adapter à votre code Android qui gère manuellement le ping.
+// const pingInterval = setInterval(() => { ... }, PING_INTERVAL_MS);
+// wss.on('close', () => { clearInterval(pingInterval); }); 
 
 // Lancer le serveur
 server.listen(PORT, () => {
-    console.log(`🚀 Serveur actif sur port ${PORT}. Écoute HTTP et WS.`);
+    console.log(`Serveur actif sur port ${PORT}. Écoute HTTP et WS.`);
 });
